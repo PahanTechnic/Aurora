@@ -8,7 +8,7 @@ import {
   Coffee, Download, Edit3, FileSpreadsheet, Filter, GlassWater, GraduationCap,
   LayoutDashboard, ListFilter, LoaderCircle, Menu, MoreHorizontal, Pencil,
   Plus, Search, Settings, ShieldCheck, Trash2, UserRound, Users, Wallet,
-  X, AlertCircle, ExternalLink, RefreshCw, Save, ReceiptText
+  X, AlertCircle, ExternalLink, RefreshCw, Save, ReceiptText, Database
 } from 'lucide-react';
 
 const STORAGE_KEY = 'aurora26-party-manager-v1';
@@ -17,7 +17,7 @@ const DEFAULT_SETTINGS = {
   schoolName: 'Kiwuldeniya Mahanama Maha Vidyalaya',
   withDrinksFee: 4400,
   withoutDrinksFee: 4400,
-  sheetUrl: ''
+  sheetUrl: '' // MongoDB Backend Server Base URL (e.g., https://your-backend.up.railway.app)
 };
 
 const money = (value) => `Rs. ${Number(value || 0).toLocaleString('en-LK', { maximumFractionDigits: 2 })}`;
@@ -36,8 +36,6 @@ const readSaved = () => {
   }
 };
 
-// Only these settings are stored in the Google Sheet "Settings" tab.
-// (sheetUrl stays in the browser, otherwise the app could not find the sheet.)
 const pickSheetSettings = (s) => ({
   eventName: String(s.eventName || '').trim(),
   schoolName: String(s.schoolName || '').trim(),
@@ -54,8 +52,6 @@ const normalizeSheetSettings = (incoming = {}) => {
   return out;
 };
 
-const withQuery = (url, query) => `${url}${url.includes('?') ? '&' : '?'}${query}`;
-
 function App() {
   const initial = useMemo(readSaved, []);
   const [people, setPeople] = useState(initial.people);
@@ -70,7 +66,7 @@ function App() {
   const [syncing, setSyncing] = useState(false);
   const [loading, setLoading] = useState(false);
   const toastTimer = useRef(null);
-  const settingsLock = useRef(false); // blocks sheet->settings overwrite while saving settings
+  const settingsLock = useRef(false);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ people, settings }));
@@ -78,12 +74,12 @@ function App() {
 
   useEffect(() => () => clearTimeout(toastTimer.current), []);
 
-  // Load from Google Sheet when the URL is set, then refresh every 30 seconds
+  // Load from MongoDB Backend when URL is set, then refresh every 30 seconds
   useEffect(() => {
     const url = settings.sheetUrl.trim();
     if (!url) return;
-    loadFromSheet(url, true);
-    const timer = setInterval(() => loadFromSheet(url, true), 30000);
+    loadFromBackend(url, true);
+    const timer = setInterval(() => loadFromBackend(url, true), 30000);
     return () => clearInterval(timer);
   }, [settings.sheetUrl]);
 
@@ -122,59 +118,61 @@ function App() {
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   }, [people, search, filter]);
 
-  const sheetReady = Boolean(settings.sheetUrl.trim());
+  const backendReady = Boolean(settings.sheetUrl.trim());
 
-  // ---------- Google Sheets: READ (people + settings) ----------
-  async function loadFromSheet(url = settings.sheetUrl, silent = false) {
+  // ---------- MongoDB: READ (people + settings) ----------
+  async function loadFromBackend(url = settings.sheetUrl, silent = false) {
     const target = (url || '').trim();
     if (!target) return false;
     setLoading(true);
     try {
-      const res = await fetch(withQuery(target, `action=list&t=${Date.now()}`));
+      const res = await fetch(`${target.replace(/\/$/, '')}/api/data?t=${Date.now()}`);
       const data = await res.json();
-      if (!data.ok) throw new Error(data.error || 'Sheet error');
+      if (!data.ok) throw new Error(data.error || 'Backend error');
 
       setPeople(Array.isArray(data.people) ? data.people : []);
 
       if (data.settings && !settingsLock.current) {
-        const fromSheet = normalizeSheetSettings(data.settings);
+        const fromDb = normalizeSheetSettings(data.settings);
         setSettings((current) => {
-          const merged = { ...current, ...fromSheet };
+          const merged = { ...current, ...fromDb };
           return JSON.stringify(merged) === JSON.stringify(current) ? current : merged;
         });
       }
 
-      if (!silent) notify(`Google Sheet eken ${data.people.length} records load una.`);
+      if (!silent) notify(`MongoDB eken ${data.people.length} records load una.`);
       return true;
     } catch (error) {
-      console.error('Load from Google Sheets failed:', error);
-      if (!silent) notify('Could not load data from Google Sheets.', 'warning');
+      console.error('Load from MongoDB failed:', error);
+      if (!silent) notify('Could not load data from MongoDB Backend.', 'warning');
       return false;
     } finally {
       setLoading(false);
     }
   }
 
-  // ---------- Google Sheets: WRITE ----------
-  async function postToSheet(url, body) {
-    // Apps Script accepts text/plain without a browser CORS preflight.
-    await fetch(url.trim(), {
-      method: 'POST',
-      mode: 'no-cors',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(body)
-    });
-  }
-
-  async function syncToSheet(action, person) {
-    if (!settings.sheetUrl.trim()) return { skipped: true };
+  // ---------- MongoDB: WRITE (Sync Ops) ----------
+  async function syncToBackend(action, person) {
+    const baseUrl = settings.sheetUrl.trim();
+    if (!baseUrl) return { skipped: true };
     setSyncing(true);
     try {
-      await postToSheet(settings.sheetUrl, { action, person });
-      await loadFromSheet(settings.sheetUrl, true); // pull fresh data from the sheet
+      const cleanUrl = baseUrl.replace(/\/$/, '');
+      if (action === 'delete') {
+        await fetch(`${cleanUrl}/api/attendees/${person.id}`, {
+          method: 'DELETE'
+        });
+      } else {
+        await fetch(`${cleanUrl}/api/attendees`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(person)
+        });
+      }
+      await loadFromBackend(baseUrl, true);
       return { sent: true };
     } catch (error) {
-      console.error('Google Sheets sync failed:', error);
+      console.error('MongoDB sync failed:', error);
       return { error: true };
     } finally {
       setSyncing(false);
@@ -205,7 +203,7 @@ function App() {
     setPeople((current) => isEditing ? current.map((p) => p.id === person.id ? person : p) : [person, ...current]);
     setModalOpen(false);
     setEditing(null);
-    const syncResult = await syncToSheet('upsert', person);
+    const syncResult = await syncToBackend('upsert', person);
     notify(isEditing ? 'Record updated.' : 'Attendee added.', syncResult.error ? 'warning' : 'success');
     return person;
   }
@@ -213,25 +211,30 @@ function App() {
   async function deletePerson(person) {
     if (!window.confirm(`Delete ${person.name}'s record? This cannot be undone.`)) return;
     setPeople((current) => current.filter((p) => p.id !== person.id));
-    const result = await syncToSheet('delete', person);
-    notify(result.error ? 'Deleted locally. Google Sheets sync failed.' : 'Record deleted.', result.error ? 'warning' : 'success');
+    const result = await syncToBackend('delete', person);
+    notify(result.error ? 'Deleted locally. MongoDB sync failed.' : 'Record deleted.', result.error ? 'warning' : 'success');
   }
 
   async function saveSettings(nextSettings) {
     setSettings(nextSettings);
     const url = nextSettings.sheetUrl.trim();
     if (!url) {
-      notify('Settings saved in this browser. Connect Google Sheets to save them online.');
+      notify('Settings saved in this browser. Connect MongoDB Backend to save them online.');
       return;
     }
     settingsLock.current = true;
     setSyncing(true);
     try {
-      await postToSheet(url, { action: 'saveSettings', settings: pickSheetSettings(nextSettings) });
-      notify('Settings saved to Google Sheet (Settings tab).');
+      const cleanUrl = url.replace(/\/$/, '');
+      await fetch(`${cleanUrl}/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(pickSheetSettings(nextSettings))
+      });
+      notify('Settings saved to MongoDB database.');
     } catch (error) {
       console.error('Settings sync failed:', error);
-      notify('Settings saved locally. Google Sheets sync failed.', 'warning');
+      notify('Settings saved locally. MongoDB sync failed.', 'warning');
     } finally {
       settingsLock.current = false;
       setSyncing(false);
@@ -291,7 +294,6 @@ function App() {
         <div style="position:absolute;left:0;right:0;bottom:35px;text-align:center;font-size:10px;color:#a58b6b;letter-spacing:.4px">Thank you. Keep this receipt for your records.</div>
       `;
       document.body.appendChild(receiptNode);
-      // Wait one frame so the external Sinhala font and logo are painted before capture.
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       const canvas = await html2canvas(receiptNode, { scale: 2, backgroundColor: '#190807', useCORS: true, logging: false });
       const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a5' });
@@ -380,7 +382,7 @@ function App() {
           <button className={activePage === 'settings' ? 'nav-item active' : 'nav-item'} onClick={() => { setActivePage('settings'); setMobileNav(false); }}><Settings size={18} /> Settings</button>
         </nav>
         <div className="sidebar-bottom">
-          <div className="sync-mini"><div className={`sync-dot ${sheetReady ? 'online' : ''}`} /><div><b>{sheetReady ? 'Sheets connected' : 'Local storage active'}</b><span>{sheetReady ? 'Google Sheets endpoint saved' : 'Connect Google Sheets in Settings'}</span></div></div>
+          <div className="sync-mini"><div className={`sync-dot ${backendReady ? 'online' : ''}`} /><div><b>{backendReady ? 'MongoDB connected' : 'Local storage active'}</b><span>{backendReady ? 'Backend endpoint active' : 'Connect Backend in Settings'}</span></div></div>
           <div className="sidebar-footer">KIWULDENIYA MAHANAMA<br />MAHA VIDYALAYA · BATCH 2026</div>
         </div>
       </aside>
@@ -392,8 +394,8 @@ function App() {
             <div><div className="eyebrow">AURORA '26 / MANAGEMENT</div><h1>{pageTitle}</h1></div>
           </div>
           <div className="topbar-actions">
-            <div className={`sync-indicator ${sheetReady ? 'connected' : ''}`}>{syncing || loading ? <LoaderCircle size={15} className="spin" /> : <span className="sync-dot" />}{syncing ? 'Syncing' : loading ? 'Loading' : sheetReady ? 'Sheets enabled' : 'Local mode'}</div>
-            <button className="light-btn" onClick={() => loadFromSheet(settings.sheetUrl)} disabled={!sheetReady || loading} title="Reload from Google Sheets">
+            <div className={`sync-indicator ${backendReady ? 'connected' : ''}`}>{syncing || loading ? <LoaderCircle size={15} className="spin" /> : <span className="sync-dot" />}{syncing ? 'Syncing' : loading ? 'Loading' : backendReady ? 'MongoDB connected' : 'Local mode'}</div>
+            <button className="light-btn" onClick={() => loadFromBackend(settings.sheetUrl)} disabled={!backendReady || loading} title="Reload from MongoDB">
               {loading ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}
             </button>
             <button className="top-add-btn" onClick={openAddModal}><Plus size={17} /> <span>Add attendee</span></button>
@@ -410,7 +412,7 @@ function App() {
         {activePage === 'attendees' && (
           <AttendeesPage people={filteredPeople} total={people.length} search={search} setSearch={setSearch} filter={filter} setFilter={setFilter} onAdd={openAddModal} onEdit={openEditModal} onDelete={deletePerson} onReceipt={downloadReceipt} />
         )}
-        {activePage === 'settings' && <SettingsPage settings={settings} onSave={saveSettings} sheetReady={sheetReady} />}
+        {activePage === 'settings' && <SettingsPage settings={settings} onSave={saveSettings} backendReady={backendReady} />}
 
         <footer className="main-footer"><span>© 2026 AURORA '26 · Party Management</span><span>Designed for Kiwuldeniya Mahanama Maha Vidyalaya</span></footer>
       </main>
@@ -525,13 +527,12 @@ function AttendeeModal({ person, settings, onClose, onSave }) {
   </div></div>;
 }
 
-function SettingsPage({ settings, onSave, sheetReady }) {
+function SettingsPage({ settings, onSave, backendReady }) {
   const [form, setForm] = useState(settings);
   const [showHelp, setShowHelp] = useState(false);
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // When settings arrive from the Google Sheet, show them in the form
   useEffect(() => { setForm(settings); }, [settings]);
 
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
@@ -556,38 +557,38 @@ function SettingsPage({ settings, onSave, sheetReady }) {
     if (!form.sheetUrl.trim()) return;
     setTesting(true);
     try {
-      const url = form.sheetUrl.trim();
-      const res = await fetch(`${url}${url.includes('?') ? '&' : '?'}action=list&t=${Date.now()}`);
+      const url = form.sheetUrl.trim().replace(/\/$/, '');
+      const res = await fetch(`${url}/api/data?t=${Date.now()}`);
       const data = await res.json();
       if (data.ok) {
         const keys = Object.keys(data.settings || {}).length;
-        alert(`Connected ✅\nAttendees: ${data.count}\nSaved settings in sheet: ${keys}`);
+        alert(`Connected ✅\nMongoDB Attendees: ${data.people.length}\nSaved Settings Keys: ${keys}`);
       } else {
         alert('Connected but error: ' + data.error);
       }
     } catch {
-      alert('Connect wenne naha. URL eka (/exec) saha deployment access "Anyone" kiyala check karanna.');
+      alert('Connect wenne naha. MongoDB Backend Server URL එක (Express Server URL) නිවැරදිද කියා බලන්න.');
     } finally { setTesting(false); }
   }
 
   return <div className="page-wrap settings-page">
-    <div className="records-intro"><div><span className="section-kicker">SYSTEM CONFIGURATION</span><h2>Settings</h2><p>Configure your party fees and Google Sheets connection.</p></div><span className="settings-badge"><ShieldCheck size={16} /> Admin settings</span></div>
+    <div className="records-intro"><div><span className="section-kicker">SYSTEM CONFIGURATION</span><h2>Settings</h2><p>Configure your party fees and MongoDB connection.</p></div><span className="settings-badge"><ShieldCheck size={16} /> Admin settings</span></div>
     <form className="settings-layout" onSubmit={submit}>
       <div className="settings-main">
         <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><CircleDollarSign size={19} /></div><div><h3>Party fee configuration</h3><p>These amounts are used to calculate each attendee's total and outstanding balance.</p></div></div>
           <div className="settings-field-grid"><label className="field-label">Fee — with drinks (Rs.)<input type="number" min="0" step="0.01" value={form.withDrinksFee} onChange={(e) => update('withDrinksFee', e.target.value)} /></label><label className="field-label">Fee — without drinks (Rs.)<input type="number" min="0" step="0.01" value={form.withoutDrinksFee} onChange={(e) => update('withoutDrinksFee', e.target.value)} /></label></div>
           <div className="settings-note"><AlertCircle size={16} /><span>Both options start at Rs. 4,400. Change the no-drinks amount above if that group has a different fee. Fee changes apply to new or edited records; existing records keep their saved totals until edited.</span></div>
         </section>
-        <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><FileSpreadsheet size={19} /></div><div><h3>Google Sheets integration</h3><p>Send attendee registrations, edits and deletions to your Google Sheet. Fees and event details are saved in the "Settings" tab.</p></div></div>
-          <label className="field-label">Apps Script Web App URL<input type="url" value={form.sheetUrl} onChange={(e) => update('sheetUrl', e.target.value)} placeholder="https://script.google.com/macros/s/.../exec" /></label>
+        <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><Database size={19} /></div><div><h3>MongoDB Database integration</h3><p>Send attendee registrations, edits, and deletions to your MongoDB Database. Fees and event details are saved securely online.</p></div></div>
+          <label className="field-label">Backend Server Base URL<input type="url" value={form.sheetUrl} onChange={(e) => update('sheetUrl', e.target.value)} placeholder="https://your-backend.up.railway.app" /></label>
           <div className="connection-row"><div className={`connection-status ${form.sheetUrl.trim() ? 'active' : ''}`}><span className="sync-dot" />{form.sheetUrl.trim() ? 'Endpoint URL entered' : 'Not connected'}</div><button type="button" className="light-btn" disabled={!form.sheetUrl.trim() || testing} onClick={testConnection}>{testing ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />} Test request</button></div>
-          <button type="button" className="help-toggle" onClick={() => setShowHelp(!showHelp)}><span>How to connect Google Sheets</span><ChevronDown size={16} className={showHelp ? 'rotate' : ''} /></button>
-          {showHelp && <div className="setup-steps"><ol><li>Create a new Google Sheet and open <b>Extensions → Apps Script</b>.</li><li>Open the <code>google-apps-script/Code.gs</code> file included in this project, paste it into Apps Script and replace <code>YOUR_SPREADSHEET_ID</code> with your Sheet ID.</li><li>Save, choose <b>Deploy → New deployment → Web app</b>.</li><li>Set <b>Execute as: Me</b> and access to <b>Anyone</b>, then deploy and authorise it.</li><li>Copy the Web App URL ending in <code>/exec</code>, paste it above and click Save settings.</li></ol><div className="security-warning"><AlertCircle size={16} /><span>The deployed endpoint can receive data from anyone who has its URL. Keep the URL private, use this only for event records, and remove/restrict the deployment after the event.</span></div></div>}
+          <button type="button" className="help-toggle" onClick={() => setShowHelp(!showHelp)}><span>How to connect MongoDB Backend</span><ChevronDown size={16} className={showHelp ? 'rotate' : ''} /></button>
+          {showHelp && <div className="setup-steps"><ol><li>Deploy the <code>server.js</code> Node.js/Express app to Railway alongside your MongoDB instance.</li><li>Set the <code>MONGO_URI</code> environment variable in Railway to point to your MongoDB connection string.</li><li>Copy your Express app's Railway public domain URL (e.g. <code>https://aurora26-backend.up.railway.app</code>).</li><li>Paste the Base URL above and click <b>Save settings</b>.</li></ol><div className="security-warning"><AlertCircle size={16} /><span>Make sure your backend enables CORS so your Vite frontend can communicate with the server without origin blocks.</span></div></div>}
         </section>
         <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><GraduationCap size={19} /></div><div><h3>Event details</h3><p>Names used in the app's navigation and reports.</p></div></div><div className="settings-field-grid"><label className="field-label">Event name<input value={form.eventName} onChange={(e) => update('eventName', e.target.value)} /></label><label className="field-label">School name<input value={form.schoolName} onChange={(e) => update('schoolName', e.target.value)} /></label></div></section>
-        <div className="settings-save-row"><span>{sheetReady ? 'Changes are saved in this browser and in your Google Sheet when you click Save.' : 'Changes are saved in this browser when you click Save.'}</span><button type="submit" className="primary-btn" disabled={saving}>{saving ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />} {saving ? 'Saving...' : 'Save settings'}</button></div>
+        <div className="settings-save-row"><span>{backendReady ? 'Changes are saved in this browser and in your MongoDB Database when you click Save.' : 'Changes are saved in this browser when you click Save.'}</span><button type="submit" className="primary-btn" disabled={saving}>{saving ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />} {saving ? 'Saving...' : 'Save settings'}</button></div>
       </div>
-      <aside className="settings-aside"><img src="/assets/aurora-26-emblem.png" alt="AURORA 26 artwork" /><div className="aside-tag">BATCH OF 2026</div><h3>AURORA '26</h3><p>{settings.schoolName}</p><div className="aside-divider" /><div className="aside-meta"><span>LOCAL DATA</span><b>Browser storage</b></div><div className="aside-meta"><span>GOOGLE SHEETS</span><b>{sheetReady ? 'Configured' : 'Not configured'}</b></div></aside>
+      <aside className="settings-aside"><img src="/assets/aurora-26-emblem.png" alt="AURORA 26 artwork" /><div className="aside-tag">BATCH OF 2026</div><h3>AURORA '26</h3><p>{settings.schoolName}</p><div className="aside-divider" /><div className="aside-meta"><span>LOCAL DATA</span><b>Browser storage</b></div><div className="aside-meta"><span>MONGODB DATA</span><b>{backendReady ? 'Configured' : 'Not configured'}</b></div></aside>
     </form>
   </div>;
 }
