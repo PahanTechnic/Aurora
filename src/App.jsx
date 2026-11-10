@@ -36,6 +36,26 @@ const readSaved = () => {
   }
 };
 
+// Only these settings are stored in the Google Sheet "Settings" tab.
+// (sheetUrl stays in the browser, otherwise the app could not find the sheet.)
+const pickSheetSettings = (s) => ({
+  eventName: String(s.eventName || '').trim(),
+  schoolName: String(s.schoolName || '').trim(),
+  withDrinksFee: Number(s.withDrinksFee) || 0,
+  withoutDrinksFee: Number(s.withoutDrinksFee) || 0
+});
+
+const normalizeSheetSettings = (incoming = {}) => {
+  const out = {};
+  if (typeof incoming.eventName === 'string' && incoming.eventName.trim()) out.eventName = incoming.eventName;
+  if (typeof incoming.schoolName === 'string' && incoming.schoolName.trim()) out.schoolName = incoming.schoolName;
+  if (incoming.withDrinksFee !== undefined && Number.isFinite(Number(incoming.withDrinksFee))) out.withDrinksFee = Number(incoming.withDrinksFee);
+  if (incoming.withoutDrinksFee !== undefined && Number.isFinite(Number(incoming.withoutDrinksFee))) out.withoutDrinksFee = Number(incoming.withoutDrinksFee);
+  return out;
+};
+
+const withQuery = (url, query) => `${url}${url.includes('?') ? '&' : '?'}${query}`;
+
 function App() {
   const initial = useMemo(readSaved, []);
   const [people, setPeople] = useState(initial.people);
@@ -48,13 +68,24 @@ function App() {
   const [mobileNav, setMobileNav] = useState(false);
   const [toast, setToast] = useState(null);
   const [syncing, setSyncing] = useState(false);
+  const [loading, setLoading] = useState(false);
   const toastTimer = useRef(null);
+  const settingsLock = useRef(false); // blocks sheet->settings overwrite while saving settings
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ people, settings }));
   }, [people, settings]);
 
   useEffect(() => () => clearTimeout(toastTimer.current), []);
+
+  // Load from Google Sheet when the URL is set, then refresh every 30 seconds
+  useEffect(() => {
+    const url = settings.sheetUrl.trim();
+    if (!url) return;
+    loadFromSheet(url, true);
+    const timer = setInterval(() => loadFromSheet(url, true), 30000);
+    return () => clearInterval(timer);
+  }, [settings.sheetUrl]);
 
   const notify = (message, type = 'success') => {
     setToast({ message, type });
@@ -93,18 +124,54 @@ function App() {
 
   const sheetReady = Boolean(settings.sheetUrl.trim());
 
+  // ---------- Google Sheets: READ (people + settings) ----------
+  async function loadFromSheet(url = settings.sheetUrl, silent = false) {
+    const target = (url || '').trim();
+    if (!target) return false;
+    setLoading(true);
+    try {
+      const res = await fetch(withQuery(target, `action=list&t=${Date.now()}`));
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'Sheet error');
+
+      setPeople(Array.isArray(data.people) ? data.people : []);
+
+      if (data.settings && !settingsLock.current) {
+        const fromSheet = normalizeSheetSettings(data.settings);
+        setSettings((current) => {
+          const merged = { ...current, ...fromSheet };
+          return JSON.stringify(merged) === JSON.stringify(current) ? current : merged;
+        });
+      }
+
+      if (!silent) notify(`Google Sheet eken ${data.people.length} records load una.`);
+      return true;
+    } catch (error) {
+      console.error('Load from Google Sheets failed:', error);
+      if (!silent) notify('Could not load data from Google Sheets.', 'warning');
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ---------- Google Sheets: WRITE ----------
+  async function postToSheet(url, body) {
+    // Apps Script accepts text/plain without a browser CORS preflight.
+    await fetch(url.trim(), {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(body)
+    });
+  }
+
   async function syncToSheet(action, person) {
     if (!settings.sheetUrl.trim()) return { skipped: true };
     setSyncing(true);
     try {
-      // Apps Script accepts text/plain without a browser CORS preflight.
-      // Its response is opaque in no-cors mode, but the request is delivered to doPost().
-      await fetch(settings.sheetUrl.trim(), {
-        method: 'POST',
-        mode: 'no-cors',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({ action, person })
-      });
+      await postToSheet(settings.sheetUrl, { action, person });
+      await loadFromSheet(settings.sheetUrl, true); // pull fresh data from the sheet
       return { sent: true };
     } catch (error) {
       console.error('Google Sheets sync failed:', error);
@@ -150,9 +217,25 @@ function App() {
     notify(result.error ? 'Deleted locally. Google Sheets sync failed.' : 'Record deleted.', result.error ? 'warning' : 'success');
   }
 
-  function saveSettings(nextSettings) {
+  async function saveSettings(nextSettings) {
     setSettings(nextSettings);
-    notify('Settings saved. New records will use the updated fees.');
+    const url = nextSettings.sheetUrl.trim();
+    if (!url) {
+      notify('Settings saved in this browser. Connect Google Sheets to save them online.');
+      return;
+    }
+    settingsLock.current = true;
+    setSyncing(true);
+    try {
+      await postToSheet(url, { action: 'saveSettings', settings: pickSheetSettings(nextSettings) });
+      notify('Settings saved to Google Sheet (Settings tab).');
+    } catch (error) {
+      console.error('Settings sync failed:', error);
+      notify('Settings saved locally. Google Sheets sync failed.', 'warning');
+    } finally {
+      settingsLock.current = false;
+      setSyncing(false);
+    }
   }
 
   async function getLogoData() {
@@ -190,7 +273,7 @@ function App() {
         <div style="text-align:center;display:flex;flex-direction:column;align-items:center">
           <img src="${logo}" alt="AURORA emblem" style="width:116px;height:116px;object-fit:cover;border-radius:50%;border:1px solid #c89532" />
           <div style="font-family:'Playfair Display',serif;font-weight:800;font-size:37px;letter-spacing:1px;color:#f6d477;margin-top:9px">AURORA '26</div>
-          <div style="font-size:11px;letter-spacing:2px;color:#dfc58c;margin-top:5px">KIWULDENIYA MAHANAMA MAHA VIDYALAYA</div>
+          <div style="font-size:11px;letter-spacing:2px;color:#dfc58c;margin-top:5px">${escapeHtml(String(settings.schoolName || '').toUpperCase())}</div>
           <div style="height:1px;background:#b98429;width:100%;margin:24px 0 18px"></div>
           <div style="font-size:19px;font-weight:800;letter-spacing:1.2px;color:#ffdf94">PARTY PAYMENT RECEIPT</div>
         </div>
@@ -246,7 +329,7 @@ function App() {
           <div style="display:flex;align-items:center;gap:18px;border-bottom:1px solid rgba(224,174,79,.28);padding-bottom:17px">
             <img src="${logo}" alt="AURORA emblem" style="width:90px;height:90px;object-fit:cover;border-radius:50%;border:1px solid #c89532" />
             <div><div style="font-family:'Playfair Display',serif;font-size:31px;font-weight:800;color:#f6d477">AURORA '26</div>
-              <div style="font-size:11px;letter-spacing:1.5px;color:#d9bd82;margin-top:4px">KIWULDENIYA MAHANAMA MAHA VIDYALAYA</div>
+              <div style="font-size:11px;letter-spacing:1.5px;color:#d9bd82;margin-top:4px">${escapeHtml(String(settings.schoolName || '').toUpperCase())}</div>
               <div style="font-size:16px;font-weight:700;color:#fff0d1;margin-top:10px">PARTY COLLECTION REPORT</div></div>
             <div style="margin-left:auto;text-align:right;color:#b99d7a;font-size:11px;line-height:1.8">Generated: ${escapeHtml(dateLabel(new Date()))}<br/>Page ${page + 1} of ${pageCount}<br/>Attendees: ${stats.count}</div>
           </div>
@@ -309,7 +392,10 @@ function App() {
             <div><div className="eyebrow">AURORA '26 / MANAGEMENT</div><h1>{pageTitle}</h1></div>
           </div>
           <div className="topbar-actions">
-            <div className={`sync-indicator ${sheetReady ? 'connected' : ''}`}>{syncing ? <LoaderCircle size={15} className="spin" /> : <span className="sync-dot" />}{syncing ? 'Syncing' : sheetReady ? 'Sheets enabled' : 'Local mode'}</div>
+            <div className={`sync-indicator ${sheetReady ? 'connected' : ''}`}>{syncing || loading ? <LoaderCircle size={15} className="spin" /> : <span className="sync-dot" />}{syncing ? 'Syncing' : loading ? 'Loading' : sheetReady ? 'Sheets enabled' : 'Local mode'}</div>
+            <button className="light-btn" onClick={() => loadFromSheet(settings.sheetUrl)} disabled={!sheetReady || loading} title="Reload from Google Sheets">
+              {loading ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}
+            </button>
             <button className="top-add-btn" onClick={openAddModal}><Plus size={17} /> <span>Add attendee</span></button>
           </div>
         </header>
@@ -443,22 +529,47 @@ function SettingsPage({ settings, onSave, sheetReady }) {
   const [form, setForm] = useState(settings);
   const [showHelp, setShowHelp] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  // When settings arrive from the Google Sheet, show them in the form
+  useEffect(() => { setForm(settings); }, [settings]);
+
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
-  function submit(e) {
+
+  async function submit(e) {
     e.preventDefault();
     if (Number(form.withDrinksFee) < 0 || Number(form.withoutDrinksFee) < 0) return;
-    onSave({ ...form, withDrinksFee: Number(form.withDrinksFee), withoutDrinksFee: Number(form.withoutDrinksFee) });
+    if (!String(form.eventName).trim() || !String(form.schoolName).trim()) return;
+    setSaving(true);
+    await onSave({
+      ...form,
+      eventName: form.eventName.trim(),
+      schoolName: form.schoolName.trim(),
+      withDrinksFee: Number(form.withDrinksFee),
+      withoutDrinksFee: Number(form.withoutDrinksFee),
+      sheetUrl: form.sheetUrl.trim()
+    });
+    setSaving(false);
   }
+
   async function testConnection() {
     if (!form.sheetUrl.trim()) return;
     setTesting(true);
     try {
-      await fetch(form.sheetUrl.trim(), { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ action: 'ping' }) });
-      alert('A test request was sent. Because Apps Script uses a no-cors browser request, the app cannot read the response. Check the Google Sheet for a connection log or use the Apps Script execution log.');
+      const url = form.sheetUrl.trim();
+      const res = await fetch(`${url}${url.includes('?') ? '&' : '?'}action=list&t=${Date.now()}`);
+      const data = await res.json();
+      if (data.ok) {
+        const keys = Object.keys(data.settings || {}).length;
+        alert(`Connected ✅\nAttendees: ${data.count}\nSaved settings in sheet: ${keys}`);
+      } else {
+        alert('Connected but error: ' + data.error);
+      }
     } catch {
-      alert('The request could not be sent. Check the URL and your internet connection.');
+      alert('Connect wenne naha. URL eka (/exec) saha deployment access "Anyone" kiyala check karanna.');
     } finally { setTesting(false); }
   }
+
   return <div className="page-wrap settings-page">
     <div className="records-intro"><div><span className="section-kicker">SYSTEM CONFIGURATION</span><h2>Settings</h2><p>Configure your party fees and Google Sheets connection.</p></div><span className="settings-badge"><ShieldCheck size={16} /> Admin settings</span></div>
     <form className="settings-layout" onSubmit={submit}>
@@ -467,16 +578,16 @@ function SettingsPage({ settings, onSave, sheetReady }) {
           <div className="settings-field-grid"><label className="field-label">Fee — with drinks (Rs.)<input type="number" min="0" step="0.01" value={form.withDrinksFee} onChange={(e) => update('withDrinksFee', e.target.value)} /></label><label className="field-label">Fee — without drinks (Rs.)<input type="number" min="0" step="0.01" value={form.withoutDrinksFee} onChange={(e) => update('withoutDrinksFee', e.target.value)} /></label></div>
           <div className="settings-note"><AlertCircle size={16} /><span>Both options start at Rs. 4,400. Change the no-drinks amount above if that group has a different fee. Fee changes apply to new or edited records; existing records keep their saved totals until edited.</span></div>
         </section>
-        <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><FileSpreadsheet size={19} /></div><div><h3>Google Sheets integration</h3><p>Send attendee registrations, edits and deletions to your Google Sheet.</p></div></div>
+        <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><FileSpreadsheet size={19} /></div><div><h3>Google Sheets integration</h3><p>Send attendee registrations, edits and deletions to your Google Sheet. Fees and event details are saved in the "Settings" tab.</p></div></div>
           <label className="field-label">Apps Script Web App URL<input type="url" value={form.sheetUrl} onChange={(e) => update('sheetUrl', e.target.value)} placeholder="https://script.google.com/macros/s/.../exec" /></label>
           <div className="connection-row"><div className={`connection-status ${form.sheetUrl.trim() ? 'active' : ''}`}><span className="sync-dot" />{form.sheetUrl.trim() ? 'Endpoint URL entered' : 'Not connected'}</div><button type="button" className="light-btn" disabled={!form.sheetUrl.trim() || testing} onClick={testConnection}>{testing ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />} Test request</button></div>
           <button type="button" className="help-toggle" onClick={() => setShowHelp(!showHelp)}><span>How to connect Google Sheets</span><ChevronDown size={16} className={showHelp ? 'rotate' : ''} /></button>
           {showHelp && <div className="setup-steps"><ol><li>Create a new Google Sheet and open <b>Extensions → Apps Script</b>.</li><li>Open the <code>google-apps-script/Code.gs</code> file included in this project, paste it into Apps Script and replace <code>YOUR_SPREADSHEET_ID</code> with your Sheet ID.</li><li>Save, choose <b>Deploy → New deployment → Web app</b>.</li><li>Set <b>Execute as: Me</b> and access to <b>Anyone</b>, then deploy and authorise it.</li><li>Copy the Web App URL ending in <code>/exec</code>, paste it above and click Save settings.</li></ol><div className="security-warning"><AlertCircle size={16} /><span>The deployed endpoint can receive data from anyone who has its URL. Keep the URL private, use this only for event records, and remove/restrict the deployment after the event.</span></div></div>}
         </section>
         <section className="settings-card"><div className="settings-card-title"><div className="settings-icon"><GraduationCap size={19} /></div><div><h3>Event details</h3><p>Names used in the app's navigation and reports.</p></div></div><div className="settings-field-grid"><label className="field-label">Event name<input value={form.eventName} onChange={(e) => update('eventName', e.target.value)} /></label><label className="field-label">School name<input value={form.schoolName} onChange={(e) => update('schoolName', e.target.value)} /></label></div></section>
-        <div className="settings-save-row"><span>Changes are saved in this browser when you click Save.</span><button type="submit" className="primary-btn"><Save size={16} /> Save settings</button></div>
+        <div className="settings-save-row"><span>{sheetReady ? 'Changes are saved in this browser and in your Google Sheet when you click Save.' : 'Changes are saved in this browser when you click Save.'}</span><button type="submit" className="primary-btn" disabled={saving}>{saving ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />} {saving ? 'Saving...' : 'Save settings'}</button></div>
       </div>
-      <aside className="settings-aside"><img src="/assets/aurora-26-emblem.png" alt="AURORA 26 artwork" /><div className="aside-tag">BATCH OF 2026</div><h3>AURORA '26</h3><p>Kiwuldeniya Mahanama Maha Vidyalaya</p><div className="aside-divider" /><div className="aside-meta"><span>LOCAL DATA</span><b>Browser storage</b></div><div className="aside-meta"><span>GOOGLE SHEETS</span><b>{sheetReady ? 'Configured' : 'Not configured'}</b></div></aside>
+      <aside className="settings-aside"><img src="/assets/aurora-26-emblem.png" alt="AURORA 26 artwork" /><div className="aside-tag">BATCH OF 2026</div><h3>AURORA '26</h3><p>{settings.schoolName}</p><div className="aside-divider" /><div className="aside-meta"><span>LOCAL DATA</span><b>Browser storage</b></div><div className="aside-meta"><span>GOOGLE SHEETS</span><b>{sheetReady ? 'Configured' : 'Not configured'}</b></div></aside>
     </form>
   </div>;
 }
